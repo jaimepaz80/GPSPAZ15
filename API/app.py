@@ -621,7 +621,7 @@ def calcular_posicion_satelite_wgs84(eph, t_emision, tau_vuelo, sys_char='G'):
     return (xs * math.cos(theta) + ys * math.sin(theta), -xs * math.sin(theta) + ys * math.cos(theta), zs, dt_sat)
 
 # =====================================================================
-# MOTOR PPK HÍBRIDO DETERMINISTA (CÁLCULO EXACTO V15 - OPTIMIZADO MÓVIL)
+# MOTOR PPK HÍBRIDO DETERMINISTA (CÁLCULO EXACTO V16 - RESILIENTE)
 # =====================================================================
 def aislar_diferencias_simples_ppk(obs_b, obs_r):
     sd_suavizada = {}
@@ -634,6 +634,7 @@ def aislar_diferencias_simples_ppk(obs_b, obs_r):
             d_b = obs_b[tow][s]
             pr_b, pr_r, cp_b, cp_r, wave_sys = None, None, None, None, None
             
+            # --- MODIFICACIÓN V16: Lógica Heterogénea Independiente por Satélite (Relajada para Android) ---
             if d_b.get('C5') and d_r.get('C5'):
                 pr_b, pr_r = d_b['C5'], d_r['C5']
                 cp_b, cp_r = d_b.get('L5'), d_r.get('L5')
@@ -709,9 +710,9 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
     try:
         X_pri = [[kf_estado['X'][0][0]], [kf_estado['X'][1][0]], [kf_estado['X'][2][0]]]
         
-        # --- MODIFICACIÓN V15: Ruido de Proceso Sub-Milimétrico para Móvil ---
+        # --- MODIFICACIÓN V16: Ruido de Proceso Adaptativo (Q) ---
         Q_noise = matid(3)
-        for i in range(3): Q_noise[i][i] = 1e-6 
+        for i in range(3): Q_noise[i][i] = 0.0001 
         P_pri = matadd(kf_estado['P'], Q_noise)
         
         h_r = kf_estado.get('h_r', 0.0)
@@ -876,7 +877,6 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
                     
                     ratio = dist_to_second / max(1e-6, dist_to_nearest)
                     
-                    # --- MODIFICACIÓN V15: Ratio Test optimizado para hardware móvil (1.5) ---
                     if ratio > 1.5: 
                         L.append([(DD_CP_m - amb_restored * wave) - DD_CP_calc])
                         H.append(dx_geom)
@@ -1334,8 +1334,10 @@ def tab3_calibrar():
             X_bg, Y_bg, Z_bg = geodesicas_a_ecef(lat_b, lon_b, utm_c)
 
             yield "[PROGRESO] Fase 1: Extracción de Límites (Pre-Scan EKF)...\n"
+            
+            # --- MODIFICACIÓN V16: Flexibilidad inicial amplia para móvil ---
             P_init = matid(3)
-            for i in range(3): P_init[i][i] = 100.0
+            for i in range(3): P_init[i][i] = 1000.0 
             
             kf_estado_raw = {'X': [[X_bg], [Y_bg], [Z_bg]], 'P': P_init, 'X_base': (X_b, Y_b, Z_b), 'fix_flags': 0, 'h_r': h_r}
             coords_raw = []
@@ -1570,8 +1572,10 @@ def tab4_procesar():
             X_bg, Y_bg, Z_bg = geodesicas_a_ecef(lat_b, lon_b, utm_c)
 
             yield "[PROGRESO] Fase 1: Pasada Forward EKF + Mareas Sólidas...\n"
+            
+            # --- MODIFICACIÓN V16: Flexibilidad inicial amplia para móvil ---
             P_init = matid(3)
-            for i in range(3): P_init[i][i] = 100.0
+            for i in range(3): P_init[i][i] = 1000.0 
             
             kf_est = {'X': [[X_bg], [Y_bg], [Z_bg]], 'P': P_init, 'X_base': (X_b, Y_b, Z_b), 'fix_flags': 0, 'h_r': h_r}
             fwd_states = []
