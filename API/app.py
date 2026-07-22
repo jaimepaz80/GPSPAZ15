@@ -14,9 +14,10 @@ import tempfile
 
 app = Flask(__name__)
 
-# --- RUTA DINÁMICA DE TRABAJO (EDICIÓN VERCEL SERVERLESS) ---
+# =====================================================================
+# CONFIGURACIÓN DEL ENTORNO Y GESTIÓN DE ESTADO (AISLAMIENTO EN RAM)
+# =====================================================================
 BASE_DIR = tempfile.gettempdir()
-
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'temp_rinex')
 REPORT_FOLDER = os.path.join(BASE_DIR, 'informes')
 STATE_FILE = os.path.join(UPLOAD_FOLDER, 'estado_proyecto.json')
@@ -27,7 +28,7 @@ os.makedirs(REPORT_FOLDER, exist_ok=True)
 STATE_LOCK = threading.Lock()
 SP3_LOCK = threading.Lock() 
 
-# --- CONSTANTES GEODÉSICAS ---
+# --- CONSTANTES GEODÉSICAS INMUTABLES ---
 C_LIGHT = 299792458.0
 OMEGA_E = 7.2921151467e-5
 MU = 3.986005e14
@@ -36,7 +37,6 @@ FREQ_L5 = 1176.45e6
 WAVE_L1 = C_LIGHT / FREQ_L1
 WAVE_L5 = C_LIGHT / FREQ_L5
 
-# --- FORMATEADOR DE ALTA PRECISIÓN ---
 def f_14(val):
     if val is None: return "0.0"
     s = f"{val:.14f}"
@@ -79,14 +79,14 @@ def gps_time_to_tow(year, month, day, hour, minute, second):
     return total - (int(total // 604800) * 604800)
 
 # =====================================================================
-# INTEGRACIÓN GOOGLE DRIVE
+# INTEGRACIÓN E/S GOOGLE DRIVE (TOLERANCIA A FALLOS SSL)
 # =====================================================================
 def descargar_desde_gdrive(url, filepath):
     match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
     if not match:
         match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
     if not match:
-        raise ValueError("URL de Google Drive no reconocida.")
+        raise ValueError("URL de Google Drive no reconocida o malformada.")
     
     file_id = match.group(1)
     direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -102,7 +102,7 @@ def descargar_desde_gdrive(url, filepath):
     return True
 
 # =====================================================================
-# ÁLGEBRA LINEAL DE ESTADO SÓLIDO
+# ÁLGEBRA LINEAL DE ESTADO SÓLIDO (INDEPENDIENTE DE MÓDULOS)
 # =====================================================================
 def transpose_matrix(M):
     if not M or not M[0]: return []
@@ -186,7 +186,7 @@ def invert_matrix_nxn(M):
     except:
         return gauss_jordan_inverse(M)
 # =====================================================================
-# PARSERS Y GESTIÓN DE ARCHIVOS
+# PARSERS Y GESTIÓN DE ARCHIVOS (INTACTOS)
 # =====================================================================
 def parse_rinex_obs_completo(path):
     obs = {}
@@ -449,34 +449,6 @@ def seleccionar_efemeride_optima(eph_list, t_target):
             valid_ephs.append((abs(dt), eph))
     if not valid_ephs: return None
     return min(valid_ephs, key=lambda x: x[0])[1]
-
-def descargar_efemerides_brdc_stream(year, month, day, hour):
-    dt = datetime.datetime(year, month, day)
-    doy = dt.timetuple().tm_yday
-    nav_descargado = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
-    if os.path.exists(nav_descargado): 
-        yield ("SUCCESS", nav_descargado)
-        return
-    prefijos = ['IGS', 'WRD', 'BKG', 'GOP']
-    urls = [f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00{p}_R_{year}{doy:03d}0000_01D_MN.rnx.gz" for p in prefijos]
-    horas = [hour] + [h for h in range(hour-1, -1, -1)] + [h for h in range(hour+1, 24)]
-    for p in prefijos:
-        for h in horas: 
-            urls.append(f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00{p}_R_{year}{doy:03d}{h:02d}00_01H_MN.rnx.gz")
-    ctx = ssl.create_default_context()
-    for url in urls:
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
-                yield ("INFO", f"> Descargando comprimido: {url.split('/')[-1]}...\n")
-                with open(nav_descargado + '.gz', 'wb') as f: f.write(res.read())
-                yield ("INFO", "> Descomprimiendo GZIP y construyendo .nav local...\n")
-                with gzip.open(nav_descargado + '.gz', 'rb') as f_in, open(nav_descargado, 'wb') as f_out: 
-                    shutil.copyfileobj(f_in, f_out)
-                yield ("SUCCESS", nav_descargado)
-                return
-        except Exception: pass
-    yield ("ERROR", "Falla catastrófica al conectar con IGS/BKG.")
 # =====================================================================
 # GEODESIA ESPACIAL Y CORRECCIONES ATMOSFÉRICAS
 # =====================================================================
@@ -659,11 +631,67 @@ def calcular_posicion_satelite_wgs84(eph, t_emision, tau_vuelo, sys_char='G'):
     zs = y_k * math.sin(i_k)
     theta = omega_e_sys * tau_vuelo
     return (xs * math.cos(theta) + ys * math.sin(theta), -xs * math.sin(theta) + ys * math.cos(theta), zs, dt_sat)
+
 # =====================================================================
-# AISLAMIENTO DE OBSERVABLES (DOBLE VÍA)
+# ENRUTADOR AUTOMÁTICO ORIGINAL (INTACTO)
 # =====================================================================
+def analizar_calidad_y_senales_rinex(obs_b, obs_r, max_gap_tolerado=0.05):
+    tows_b = sorted(list(obs_b.keys()))
+    tows_r = sorted(list(obs_r.keys()))
+    
+    if not tows_b or not tows_r: return "MODO_C_SPP", 0.0, "Cero épocas. Archivo vacío o corrupto."
+    
+    t_ini_b, t_fin_b = tows_b[0], tows_b[-1]
+    t_ini_r, t_fin_r = tows_r[0], tows_r[-1]
+    
+    overlap_ini = max(t_ini_b, t_ini_r)
+    overlap_fin = min(t_fin_b, t_fin_r)
+    
+    if overlap_ini > overlap_fin:
+        return "MODO_C_SPP", 0.0, "Cero solapamiento temporal entre Base y Rover. Requiere cálculo autónomo."
+        
+    sync_epochs = 0
+    async_epochs = 0
+    fase_valid = 0
+    total_eval = 0
+    
+    for tr in tows_r:
+        if tr < overlap_ini or tr > overlap_fin: continue
+        total_eval += 1
+        idx = min(range(len(tows_b)), key=lambda i: abs(tows_b[i] - tr))
+        gap = abs(tows_b[idx] - tr)
+        
+        if gap <= max_gap_tolerado:
+            sync_epochs += 1
+            d_r = obs_r[tr]
+            d_b = obs_b[tows_b[idx]]
+            tiene_fase = False
+            for s in d_r:
+                if s == '_meta' or s not in d_b: continue
+                if (d_r[s].get('L1') and d_b[s].get('L1')) or (d_r[s].get('L5') and d_b[s].get('L5')):
+                    tiene_fase = True
+                    break
+            if tiene_fase: fase_valid += 1
+        else:
+            async_epochs += 1
+            
+    if total_eval == 0: return "MODO_C_SPP", 0.0, "Sin épocas en la ventana de solapamiento."
+    
+    ratio_sync = sync_epochs / total_eval
+    ratio_fase = fase_valid / max(1, sync_epochs)
+    
+    if ratio_sync > 0.5:
+        if ratio_fase > 0.1:
+            return "MODO_A_FASE", ratio_sync, f"Sincronía homogénea detectada ({ratio_sync*100:.1f}%). Fase portadora válida presente."
+        else:
+            return "MODO_A_CODIGO", ratio_sync, f"Sincronía homogénea detectada ({ratio_sync*100:.1f}%). Predominio exclusivo de código (Fase nula o corrupta)."
+    else:
+        return "MODO_B_ASINCRONO", ratio_sync, f"Alta asincronía detectada. Gap supera {max_gap_tolerado}s en la mayoría de las épocas."
+# =====================================================================
+# AISLAMIENTO DE OBSERVABLES (DOBLE VÍA ABSOLUTA)
+# =====================================================================
+# EXTRACTOR EXCLUSIVO MÓDULO A (INTACTO DE app (7).py)
 def aislar_diferencias_simples_ppk(obs_b, obs_r):
-    # EXTRACTOR MÓDULO A: Extrae fase y código para el EKF (De app (7).py)
     sd_suavizada = {}
     for tow in sorted(list(obs_r.keys())):
         if tow not in obs_b: continue
@@ -715,8 +743,8 @@ def obtener_base_cercana(obs_b, t_target, max_gap=0.5):
     if abs(tows[idx] - t_target) > max_gap: return None, None
     return tows[idx], obs_b[tows[idx]]
 
+# EXTRACTOR EXCLUSIVO MÓDULO B (CLON AISLADO PARA TERMUX)
 def aislar_diferencias_simples_ppk_asincrono(obs_b_full, obs_r, max_gap=0.5):
-    # EXTRACTOR MÓDULO B: Extrae solo código puro para IRLS (De versión Termux antigua)
     sd_suavizada = {}
     for tow_r in sorted(list(obs_r.keys())):
         tow_b, base_cercana = obtener_base_cercana(obs_b_full, tow_r, max_gap)
@@ -747,7 +775,7 @@ def aislar_diferencias_simples_ppk_asincrono(obs_b_full, obs_r, max_gap=0.5):
     return sd_suavizada
 
 # =====================================================================
-# MÓDULO A: MOTOR EKF + LAMBDA + RTS (DISPOSITIVOS HOMOGÉNEOS)
+# VÍA 1 -> MÓDULO A: MOTOR EKF + LAMBDA + RTS (INTACTO)
 # =====================================================================
 def decorrelacion_lambda_z(Q):
     n = len(Q)
@@ -834,7 +862,7 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         
         sat_positions = {}
         for s, d in sd_epoca.items():
-            if s.startswith('_') or d.get('sd_P') is None: continue 
+            if s == '_meta' or s == '_tow_b' or d['sd_P'] is None: continue 
             tau_r = d['pr_r'] / C_LIGHT
             tau_b = d['pr_b'] / C_LIGHT
             
@@ -1008,7 +1036,7 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         return None, f"FAILED_EXCEPTION:_{str(e)}", kf_estado, None
 
 # =====================================================================
-# MÓDULO B: MOTOR IRLS TERMUX (DISPOSITIVOS ASINCRÓNICOS)
+# VÍA 2 -> MÓDULO B: MOTOR IRLS TERMUX (CLON AISLADO)
 # =====================================================================
 def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle):
     try:
@@ -1020,7 +1048,7 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle):
         
         sat_positions = {}
         for s, d in sd_epoca.items():
-            # CORRECCIÓN VITAL: Evitar leer el flag _tow_b como satélite
+            # AISLAMIENTO: Ignora metadata de tiempo base para no colapsar matriz
             if s.startswith('_') or d.get('sd_P') is None: continue 
             
             tau = d['pr_r'] / C_LIGHT
@@ -1278,7 +1306,7 @@ def generar_informe_homogeneizacion_detallado(base_name, rover_name, base_raw, r
 
 def generar_informe_ascii(tipo, p_dict):
     estado_sol = f"HÍBRIDO PPK/EKF ({p_dict.get('fix_r', 0.0):.1f}% FIXED)" if p_dict.get('fix_r', 0.0) > 0 else 'FLOAT'
-    if p_dict.get('estrategia') == 'MÓDULO B (IRLS Asincrónico Termux)':
+    if p_dict.get('estrategia') == 'MODO_B_ASINCRONO':
         estado_sol = 'FLOAT (DGPS Clásico Termux)'
     elif p_dict.get('fix_r', 0.0) == 0.0:
         estado_sol = 'FLOAT (EKF)'
@@ -1333,7 +1361,7 @@ def generar_informe_ascii(tipo, p_dict):
     return informe
 
 # =====================================================================
-# RUTAS FLASK (FLUJO ARQUITECTÓNICO CORREGIDO Y SIN CAJA NEGRA)
+# RUTAS FLASK (ENRUTADOR AUTÓNOMO RESTAURADO Y AISLAMIENTO TOTAL)
 # =====================================================================
 @app.route('/')
 def index():
@@ -1391,9 +1419,6 @@ def tab1_homogenizar():
             yield f"\n> [SISTEMA] Iniciando Etapa 1: Emparejamiento Base Pivote y Rover de Calibración...\n"
             base_raw_dict = parse_rinex_obs_completo(p_b_raw)
             rover_raw_dict = parse_rinex_obs_completo(p_r_raw)
-            
-            yield f"  [AUDITORÍA DE RUTA] Enrutador Automático Eliminado.\n"
-            yield f"  [SISTEMA] Las señales se evaluarán directamente por la tolerancia temporal impuesta.\n\n"
             
             base_sinc, rover_sinc = {}, {}
             total_epochs = len(rover_raw_dict)
@@ -1531,11 +1556,6 @@ def tab3_calibrar():
 
     def procesar():
         try:
-            # RUTEO ESTRICTO SEGÚN TOLERANCIA
-            is_homogeneo = (p_max_gap <= 0.05)
-            motor_str = "MÓDULO A (EKF Homogéneo)" if is_homogeneo else "MÓDULO B (IRLS Asincrónico Termux)"
-            
-            yield f"> [SISTEMA] Iniciando Búsqueda Determinista | {motor_str}...\n"
             if utm_e == 0.0 or utm_n == 0.0 or utm_n_r == 0.0 or utm_e_r == 0.0: 
                 yield "> [ERROR] Coordenadas Base y Rover no inyectadas correctamente.\n"; return
             
@@ -1552,16 +1572,23 @@ def tab3_calibrar():
             nav = parse_rinex_nav_real(nav_path)
             sp3 = parse_sp3_preciso(sp3_path) if sp3_path else {}
             
-            yield f"[PROGRESO] Tolerancia manual: {f_14(p_max_gap)}s -> Activando motor exclusivo...\n"
+            # --- INTERVENCIÓN DEL ENRUTADOR AUTOMÁTICO ---
+            modo_str, ratio, msg = analizar_calidad_y_senales_rinex(obs_b_raw, obs_r_raw, max_gap_tolerado=p_max_gap)
+            yield f"> [ENRUTADOR] Análisis completado: {msg}\n"
+            
+            if modo_str == "MODO_C_SPP":
+                yield "\n> [ERROR] Operación Abortada: El Enrutador detectó MODO C (SPP). Requiere implementación geométrica dedicada (aislada de A y B).\n"
+                return
             
             lat_b, lon_b, _ = utm_a_geodesicas(utm_e, utm_n, utm_h, utm_hem)
             X_b, Y_b, Z_b = geodesicas_a_ecef(lat_b, lon_b, utm_c + h_b)
             X_bg, Y_bg, Z_bg = geodesicas_a_ecef(lat_b, lon_b, utm_c)
 
-            if is_homogeneo:
+            if modo_str.startswith("MODO_A"):
                 # =========================================================
                 # MÓDULO A: LÓGICA EKF PARA DISPOSITIVOS HOMOGÉNEOS
                 # =========================================================
+                yield f"> [SISTEMA] Iniciando Búsqueda Determinista | MÓDULO A (EKF Homogéneo)...\n"
                 sd_suavizada = aislar_diferencias_simples_ppk(obs_b_raw, obs_r_raw)
                 if not sd_suavizada: yield "> [ERROR] No hay épocas sincronizadas válidas.\n"; return
                 t_sample = list(sd_suavizada.keys())
@@ -1673,10 +1700,11 @@ def tab3_calibrar():
                     else:
                         m_span /= 2.0; cp_span /= 2.0; ca_span /= 2.0; snr_span /= 2.0; gap_span /= 2.0
                         
-            else:
+            elif modo_str == "MODO_B_ASINCRONO":
                 # =========================================================
                 # MÓDULO B: LÓGICA IRLS PARA ASINCRÓNICOS (TERMUX)
                 # =========================================================
+                yield f"> [SISTEMA] Iniciando Búsqueda Determinista | MÓDULO B (IRLS Asincrónico Termux)...\n"
                 p_b_raw = leer_estado('base_raw')
                 p_r_raw = os.path.join(UPLOAD_FOLDER, 'rover_calibracion_raw.obs')
                 obs_b_full = parse_rinex_obs_completo(p_b_raw) if p_b_raw and os.path.exists(p_b_raw) else obs_b_raw
@@ -1760,7 +1788,7 @@ def tab3_calibrar():
                     else:
                         m_span /= 2.0; cp_span /= 2.0; ca_span /= 2.0
             
-            # GUARDADO FINAL COMÚN
+            # GUARDADO FINAL COMÚN A Y B
             if best_rmse != float('inf'):
                 guardar_estado('opt_mask', best_params['mask'])
                 guardar_estado('opt_cp', best_params['cp'])
@@ -1769,13 +1797,13 @@ def tab3_calibrar():
                 guardar_estado('opt_snr', best_params.get('snr', p_snr))
                 guardar_estado('opt_eh', best_params['eh'])
                 guardar_estado('opt_ev', best_params['ev'])
-                guardar_estado('estrategia_activa', motor_str)
+                guardar_estado('estrategia_activa', modo_str)
 
                 yield "\n========================================================\n"
-                yield f"      [INFORME] PARÁMETROS ÓPTIMOS ({motor_str})\n"
+                yield f"      [INFORME] PARÁMETROS ÓPTIMOS ({modo_str})\n"
                 yield "========================================================\n"
                 yield f"  [-] Tolerancia Sync (max_gap): {f_14(best_params.get('max_gap', p_max_gap))}\n"
-                if is_homogeneo: yield f"  [-] Máscara SNR (dBHz): {f_14(best_params.get('snr', p_snr))}\n"
+                if modo_str.startswith("MODO_A"): yield f"  [-] Máscara SNR (dBHz): {f_14(best_params.get('snr', p_snr))}\n"
                 yield f"  [-] Máscara Elevación (°): {f_14(best_params['mask'])}\n"
                 yield f"  [-] Filtro Sigma Plan (cp): {f_14(best_params['cp'])}\n"
                 yield f"  [-] Filtro Sigma Alt (ca): {f_14(best_params['ca'])}\n"
@@ -1827,10 +1855,6 @@ def tab4_procesar():
             descargar_desde_gdrive(url_rover_nuevo, p_r_nuevo)
             rf_nuevo_filename = "Drive_Nuevo_Rover.obs"
             
-            is_homogeneo = (p_max_gap <= 0.05)
-            motor_str = "MÓDULO A (EKF + RTS Smoother)" if is_homogeneo else "MÓDULO B (IRLS Clásico Termux)"
-            yield f"\n> [SISTEMA] Iniciando Procesamiento DGPS | {motor_str}...\n"
-            
             nav_path = leer_estado('nav_path')
             sp3_path = leer_estado('sp3_path')
             p_b_raw = leer_estado('base_raw') 
@@ -1843,16 +1867,25 @@ def tab4_procesar():
             nav = parse_rinex_nav_real(nav_path)
             sp3 = parse_sp3_preciso(sp3_path) if sp3_path else {}
             
-            if sp3 and is_homogeneo: yield "[PROGRESO] Órbitas Precisas SP3 acopladas con éxito...\n"
+            # --- INTERVENCIÓN DEL ENRUTADOR AUTOMÁTICO ---
+            modo_str, ratio, msg = analizar_calidad_y_senales_rinex(obs_b_raw, obs_r_raw, max_gap_tolerado=p_max_gap)
+            yield f"> [ENRUTADOR] Análisis completado: {msg}\n"
+            
+            if modo_str == "MODO_C_SPP":
+                yield "\n> [ERROR] Operación Abortada: El Enrutador detectó MODO C (SPP). Requiere implementación geométrica dedicada (aislada de A y B).\n"
+                return
             
             lat_b, lon_b, _ = utm_a_geodesicas(utm_e, utm_n, utm_h, utm_hem)
             X_b, Y_b, Z_b = geodesicas_a_ecef(lat_b, lon_b, utm_c + h_b)
             X_bg, Y_bg, Z_bg = geodesicas_a_ecef(lat_b, lon_b, utm_c)
 
-            if is_homogeneo:
+            if modo_str.startswith("MODO_A"):
                 # =========================================================
                 # MÓDULO A: LÓGICA EKF PARA DISPOSITIVOS HOMOGÉNEOS
                 # =========================================================
+                yield f"\n> [SISTEMA] Iniciando Procesamiento DGPS | MÓDULO A (EKF + RTS Smoother)...\n"
+                if sp3: yield "[PROGRESO] Órbitas Precisas SP3 acopladas con éxito...\n"
+                
                 rover_tows = sorted(list(obs_r_raw.keys()))
                 base_tows = sorted(list(obs_b_raw.keys()))
                 obs_b_sync = {}
@@ -1894,11 +1927,13 @@ def tab4_procesar():
                     nt, et = geodesicas_a_utm(la, lo, utm_h)
                     coords.append((nt, et, al, fwd_states[i]['status']))
 
-            else:
+            elif modo_str == "MODO_B_ASINCRONO":
                 # =========================================================
                 # MÓDULO B: LÓGICA IRLS PARA ASINCRÓNICOS (TERMUX)
                 # =========================================================
+                yield f"\n> [SISTEMA] Iniciando Procesamiento DGPS | MÓDULO B (IRLS Clásico Termux)...\n"
                 yield "[PROGRESO] Extrayendo Observables Asincrónicas...\n"
+                
                 sd_suavizada = aislar_diferencias_simples_ppk_asincrono(obs_b_raw, obs_r_raw, max_gap=p_max_gap)
                 if not sd_suavizada: yield "\n> [ERROR] No hay épocas sincronizadas válidas.\n"; return
                 
@@ -1927,7 +1962,7 @@ def tab4_procesar():
             
             p_dict = {
                 'mask': p_mask, 'cp': p_cp, 'ca': p_ca,
-                'max_gap': p_max_gap, 'snr': p_snr if is_homogeneo else 0.0,
+                'max_gap': p_max_gap, 'snr': p_snr if modo_str.startswith("MODO_A") else 0.0,
                 'err_h': err_hor_max, 'err_v': err_ver_max,
                 'nf': nf, 'ef': ef, 'zf': zf - h_r, 
                 'ret': ret, 'total': len(coords), 'std_n': std_n, 'std_e': std_e, 'std_z': std_z,
@@ -1935,10 +1970,10 @@ def tab4_procesar():
                 'base_file': leer_estado('name_base_raw') or "Drive_Base.obs",
                 'rover_file': rf_nuevo_filename,
                 'nav_file': leer_estado('name_nav_file') or "auto_nav.nav",
-                'sp3_file': leer_estado('name_sp3_file') if is_homogeneo else None,
+                'sp3_file': leer_estado('name_sp3_file') if modo_str.startswith("MODO_A") else None,
                 'b_n': utm_n, 'b_e': utm_e, 'b_z': utm_c,
                 'r_n_calc': nf, 'r_e_calc': ef, 'r_z_calc': zf - h_r,
-                'estrategia': estrategia
+                'estrategia': modo_str
             }
             
             yield "[PROGRESO] Ajuste Finalizado.\n"
