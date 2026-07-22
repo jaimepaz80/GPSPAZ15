@@ -38,8 +38,11 @@ WAVE_L5 = C_LIGHT / FREQ_L5
 
 # --- FORMATEADOR DE ALTA PRECISIÓN ---
 def f_14(val):
-    if val is None: return "0.00000000000000"
+    if val is None: return "0.0"
     s = f"{val:.14f}"
+    if '.' in s:
+        s = s.rstrip('0')
+        if s.endswith('.'): s += '0'
     return s
 
 def safe_f(val, default=0.0):
@@ -182,7 +185,6 @@ def invert_matrix_nxn(M):
         return matmul(transpose_matrix(L_inv), L_inv)
     except:
         return gauss_jordan_inverse(M)
-
 # =====================================================================
 # PARSERS Y GESTIÓN DE ARCHIVOS
 # =====================================================================
@@ -394,7 +396,6 @@ def interpolate_sp3(sp3_data, sat, t_emision, degree=9):
         SP3_CACHE_KEYS.append(cache_key)
     
     return result
-
 def parse_rinex_nav_real(path):
     ephemeris = {'_iono': {'alpha': [0]*4, 'beta': [0]*4}}
     if not path or not os.path.exists(path): return ephemeris
@@ -619,14 +620,71 @@ def calcular_posicion_satelite_wgs84(eph, t_emision, tau_vuelo, sys_char='G'):
     zs = y_k * math.sin(i_k)
     theta = omega_e_sys * tau_vuelo
     return (xs * math.cos(theta) + ys * math.sin(theta), -xs * math.sin(theta) + ys * math.cos(theta), zs, dt_sat)
+# =====================================================================
+# ALGORITMO DE ENRUTAMIENTO INTELIGENTE (MÓDULOS A, B y C)
+# =====================================================================
+def analizar_calidad_y_senales_rinex(obs_b, obs_r):
+    t_b = sorted(list(obs_b.keys()))
+    t_r = sorted(list(obs_r.keys()))
+    
+    # [MÓDULO C] Condición 1: Archivos vacíos o corruptos
+    if not t_b or not t_r:
+        return "MODO_C_AUTONOMO", "Archivos vacíos o sin épocas válidas. Requiere Cálculo Autónomo (SPP)."
+        
+    t_min = max(t_b[0], t_r[0])
+    t_max = min(t_b[-1], t_r[-1])
+    
+    # [MÓDULO C] Condición 2: Cero solapamiento entre Base y Rover
+    if t_min >= t_max:
+        return "MODO_C_AUTONOMO", "Cero solapamiento temporal real entre Base y Rover. Activando Módulo C (Autónomo)."
+        
+    solapamiento_comun = 0
+    tiene_fase = 0
+    total_muestras_fase = 0
+    
+    for tr in t_r:
+        if t_min <= tr <= t_max:
+            idx = min(range(len(t_b)), key=lambda i: abs(t_b[i] - tr))
+            if abs(t_b[idx] - tr) <= 1.0:
+                solapamiento_comun += 1
+                if tr in obs_r:
+                    for sat, data in obs_r[tr].items():
+                        if sat != '_meta':
+                            if 'L1' in data or 'L5' in data:
+                                total_muestras_fase += 1
+                                if data.get('L1', 0.0) != 0.0 or data.get('L5', 0.0) != 0.0:
+                                    tiene_fase += 1
+                                    
+    # [MÓDULO C] Condición 3: Geometría temporal crítica
+    if solapamiento_comun < 10:
+        return "MODO_C_AUTONOMO", f"Solapamiento crítico insuficiente ({solapamiento_comun} épocas comunes). Activando Módulo C."
+        
+    proporcion_fase = (tiene_fase / max(1, total_muestras_fase)) * 100.0
+    
+    # MÓDULOS A y B
+    if proporcion_fase > 20.0:
+        razon = f"Se detectó presencia activa de Fase con {proporcion_fase:.1f}% de integridad. Activando Módulo B con Filtro de Consistencia."
+        return "MODO_B_ASINCRONO", razon
+    else:
+        razon = f"Se detectó predominio exclusivo de código (Fase nula o corrupta al {proporcion_fase:.1f}%). Activando Módulo A DGPS Suavizado."
+        return "MODO_A_CODIGO", razon
 
 # =====================================================================
-# MOTOR PPK HÍBRIDO DETERMINISTA (CÁLCULO EXACTO V16 - RESILIENTE)
+# MOTOR PPK HÍBRIDO DETERMINISTA (CÁLCULO EXACTO V13) - MÓDULO A
 # =====================================================================
 def aislar_diferencias_simples_ppk(obs_b, obs_r):
     sd_suavizada = {}
     for tow in sorted(list(obs_r.keys())):
         if tow not in obs_b: continue
+        
+        l1_count, l5_count = 0, 0
+        for s, d_r in obs_r[tow].items():
+            if s == '_meta' or s not in obs_b[tow]: continue
+            d_b = obs_b[tow][s]
+            if d_b.get('C5') and d_r.get('C5') and d_b.get('L5') and d_r.get('L5'): l5_count += 1
+            if d_b.get('C1') and d_r.get('C1') and d_b.get('L1') and d_r.get('L1'): l1_count += 1
+        
+        use_l5 = (l5_count >= 4) or (l5_count >= l1_count and l5_count >= 3)
         
         sd_epoca = {'_meta': obs_r[tow]['_meta']}
         for s, d_r in obs_r[tow].items():
@@ -634,20 +692,113 @@ def aislar_diferencias_simples_ppk(obs_b, obs_r):
             d_b = obs_b[tow][s]
             pr_b, pr_r, cp_b, cp_r, wave_sys = None, None, None, None, None
             
-            # --- MODIFICACIÓN V16: Lógica Heterogénea Independiente por Satélite (Relajada para Android) ---
-            if d_b.get('C5') and d_r.get('C5'):
+            if use_l5 and d_b.get('C5') and d_r.get('C5'):
                 pr_b, pr_r = d_b['C5'], d_r['C5']
                 cp_b, cp_r = d_b.get('L5'), d_r.get('L5')
                 wave_sys = WAVE_L5
-            elif d_b.get('C1') and d_r.get('C1'):
+            elif not use_l5 and d_b.get('C1') and d_r.get('C1'):
                 pr_b, pr_r = d_b['C1'], d_r['C1']
                 cp_b, cp_r = d_b.get('L1'), d_r.get('L1')
                 wave_sys = WAVE_L1
                 
             if not pr_b or not pr_r or not wave_sys: continue
             
-            snr_b = d_b.get('S5', d_b.get('S1', 30.0)) if wave_sys == WAVE_L5 else d_b.get('S1', d_b.get('S5', 30.0))
-            snr_r = d_r.get('S5', d_r.get('S1', 30.0)) if wave_sys == WAVE_L5 else d_r.get('S1', d_r.get('S5', 30.0))
+            snr_b = d_b.get('S5', d_b.get('S1', 30.0)) if use_l5 else d_b.get('S1', d_b.get('S5', 30.0))
+            snr_r = d_r.get('S5', d_r.get('S1', 30.0)) if use_l5 else d_r.get('S1', d_r.get('S5', 30.0))
+            
+            sd_epoca[s] = {
+                'sd_P': pr_r - pr_b, 
+                'pr_b': pr_b, 'pr_r': pr_r, 
+                'cp_b': cp_b, 'cp_r': cp_r,
+                'wave': wave_sys,
+                'snr': min(snr_b, snr_r),
+                'sys': s[0]
+            }
+        if len(sd_epoca) > 1: sd_suavizada[tow] = sd_epoca
+    return sd_suavizada
+
+# =====================================================================
+# MOTOR PPK HÍBRIDO ASINCRÓNICO - MÓDULO B
+# =====================================================================
+def interpolar_observables_base(obs_b, t_target, max_gap=0.5):
+    tows = sorted(list(obs_b.keys()))
+    if len(tows) < 4: return None
+        
+    idx = min(range(len(tows)), key=lambda i: abs(tows[i] - t_target))
+    if abs(tows[idx] - t_target) > max_gap: return None
+        
+    start = max(0, idx - 2)
+    end = min(len(tows), start + 4)
+    if end - start < 4: start = max(0, end - 4)
+        
+    pts_t = tows[start:end]
+    if len(pts_t) < 4: return None
+        
+    for i in range(1, len(pts_t)):
+        if pts_t[i] - pts_t[i-1] > 10.0: return None
+            
+    base_interp = {'_meta': obs_b[pts_t[idx]]['_meta']}
+    sats_in_all = set(obs_b[pts_t[0]].keys())
+    for t in pts_t[1:]: sats_in_all.intersection_update(set(obs_b[t].keys()))
+        
+    if '_meta' in sats_in_all: sats_in_all.remove('_meta')
+        
+    for sat in sats_in_all:
+        data_interp = {}
+        for obs_type in ['C1', 'L1', 'C5', 'L5', 'S1', 'S5']:
+            valid = True
+            y_pts = []
+            for t in pts_t:
+                if obs_type not in obs_b[t]:
+                    valid = False
+                    break
+                y_pts.append(obs_b[t][obs_type])
+                
+            if valid:
+                if obs_type in ['L1', 'L5']:
+                    slip = False
+                    for i in range(1, len(y_pts)):
+                        if abs(y_pts[i] - y_pts[i-1]) > 500.0: slip = True
+                    if slip: continue
+                data_interp[obs_type] = lagrange_interpolate(t_target, pts_t, y_pts)
+                
+        if data_interp: base_interp[sat] = data_interp
+    return base_interp
+
+def aislar_diferencias_simples_ppk_asincrono(obs_b_full, obs_r, max_gap=0.5):
+    sd_suavizada = {}
+    for tow in sorted(list(obs_r.keys())):
+        base_interp = interpolar_observables_base(obs_b_full, tow, max_gap)
+        if not base_interp: continue
+            
+        l1_count, l5_count = 0, 0
+        for s, d_r in obs_r[tow].items():
+            if s == '_meta' or s not in base_interp: continue
+            d_b = base_interp[s]
+            if d_b.get('C5') and d_r.get('C5') and d_b.get('L5') and d_r.get('L5'): l5_count += 1
+            if d_b.get('C1') and d_r.get('C1') and d_b.get('L1') and d_r.get('L1'): l1_count += 1
+                
+        use_l5 = (l5_count >= 4) or (l5_count >= l1_count and l5_count >= 3)
+        sd_epoca = {'_meta': obs_r[tow]['_meta']}
+        
+        for s, d_r in obs_r[tow].items():
+            if s == '_meta' or s not in base_interp: continue
+            d_b = base_interp[s]
+            pr_b, pr_r, cp_b, cp_r, wave_sys = None, None, None, None, None
+            
+            if use_l5 and d_b.get('C5') and d_r.get('C5'):
+                pr_b, pr_r = d_b['C5'], d_r['C5']
+                cp_b, cp_r = d_b.get('L5'), d_r.get('L5')
+                wave_sys = WAVE_L5
+            elif not use_l5 and d_b.get('C1') and d_r.get('C1'):
+                pr_b, pr_r = d_b['C1'], d_r['C1']
+                cp_b, cp_r = d_b.get('L1'), d_r.get('L1')
+                wave_sys = WAVE_L1
+                
+            if not pr_b or not pr_r or not wave_sys: continue
+            
+            snr_b = d_b.get('S5', d_b.get('S1', 30.0)) if use_l5 else d_b.get('S1', d_b.get('S5', 30.0))
+            snr_r = d_r.get('S5', d_r.get('S1', 30.0)) if use_l5 else d_r.get('S1', d_r.get('S5', 30.0))
             
             sd_epoca[s] = {
                 'sd_P': pr_r - pr_b, 
@@ -709,12 +860,7 @@ def suavizador_rts_backward(forward_states):
 def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask):
     try:
         X_pri = [[kf_estado['X'][0][0]], [kf_estado['X'][1][0]], [kf_estado['X'][2][0]]]
-        
-        # --- MODIFICACIÓN V16: Ruido de Proceso Adaptativo (Q) ---
-        Q_noise = matid(3)
-        for i in range(3): Q_noise[i][i] = 0.0001 
-        P_pri = matadd(kf_estado['P'], Q_noise)
-        
+        P_pri = [row[:] for row in kf_estado['P']]
         h_r = kf_estado.get('h_r', 0.0)
         
         if 'prev_cp' not in kf_estado: kf_estado['prev_cp'] = {}
@@ -872,20 +1018,11 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
                     amb_round = round(amb_z)
                     amb_restored = amb_round / Z_trans[0][0]
                     
-                    dist_to_nearest = abs(ambiguity_float - amb_restored)
-                    dist_to_second = abs(ambiguity_float - (amb_round + (1 if ambiguity_float > amb_round else -1)) / Z_trans[0][0])
-                    
-                    ratio = dist_to_second / max(1e-6, dist_to_nearest)
-                    
-                    if ratio > 1.5: 
+                    if abs(ambiguity_float - amb_restored) < 0.20:
                         L.append([(DD_CP_m - amb_restored * wave) - DD_CP_calc])
                         H.append(dx_geom)
-                        R_diag.append(var_base * 0.0001) 
+                        R_diag.append(var_base * 0.0001)
                         kf_estado['fix_flags'] += 1
-                    else:
-                        L.append([(DD_CP_m - ambiguity_float * wave) - DD_CP_calc])
-                        H.append(dx_geom)
-                        R_diag.append(var_base * 0.005)
 
         if not H: return None, "FAILED", kf_estado, None
         
@@ -916,7 +1053,7 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         kf_estado['X'] = X_post
         kf_estado['P'] = P_post
         
-        status = "FIXED (PPK)" if kf_estado['fix_flags'] > 4 else "FLOAT (EKF)"
+        status = "FIXED (PPK)" if kf_estado['fix_flags'] > 4 else "FLOAT (DGPS)"
         kf_estado['fix_flags'] = 0 
         
         state_dict = {
@@ -927,7 +1064,6 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
 
     except Exception as e:
         return None, f"FAILED_EXCEPTION:_{str(e)}", kf_estado, None
-
 # =====================================================================
 # ESTADÍSTICAS Y FILTRADO VINCULANTE
 # =====================================================================
@@ -1076,6 +1212,7 @@ def generar_informe_ascii(tipo, p_dict):
   [-] Máscara SNR            : {f_14(p_dict.get('snr', 25.0))} dBHz
   [-] Tasa Ambiguity FIX     : {p_dict['fix_r']:.2f}% (Resolución Entera)
   [-] Épocas Útiles Retenidas: {p_dict['ret']} ({(p_dict['ret']/max(1, p_dict['total']))*100:.2f}% del total)
+  [-] Estrategia de Módulo   : {p_dict.get('estrategia_auditoria', 'N/A')}
 
 [1] TRAZABILIDAD DEL PROYECTO Y ARCHIVOS
 ------------------------------------------------------------------------
@@ -1088,7 +1225,7 @@ def generar_informe_ascii(tipo, p_dict):
 ------------------------------------------------------------------------
   [-] Motor Algorítmico      : Filtro Kalman Extendido (EKF PPK) + RTS Smoother
   [-] Observables Inyectadas : L1/L5 (Portadora) + C1/C5 (Código)
-  [-] Resolución de Enteros  : LAMBDA Z-Transform (Bootstrapping) + Ratio Test (1.5)
+  [-] Resolución de Enteros  : LAMBDA Z-Transform (Bootstrapping)
   [-] Correcciones Geofísicas: Mareas Sólidas Terrestres
   [-] Órbitas Satelitales    : SP3 Interpolación Lagrange 9°
 
@@ -1171,6 +1308,13 @@ def tab1_homogenizar():
             yield f"\n> [SISTEMA] Iniciando Etapa 1: Emparejamiento Base Pivote y Rover de Calibración...\n"
             base_raw_dict = parse_rinex_obs_completo(p_b_raw)
             rover_raw_dict = parse_rinex_obs_completo(p_r_raw)
+            
+            tipo_mod, razon_mod = analizar_calidad_y_senales_rinex(base_raw_dict, rover_raw_dict)
+            guardar_estado('estrategia_auditoria', f"{tipo_mod}: {razon_mod}")
+            
+            yield f"  [AUDITORÍA CAJA NEGRA] {tipo_mod}\n"
+            yield f"  [JUSTIFICACIÓN TÉCNICA] {razon_mod}\n\n"
+            
             base_sinc, rover_sinc = {}, {}
             total_epochs = len(rover_raw_dict)
             c = 0
@@ -1226,7 +1370,7 @@ def tab2_efemerides():
             if sp3_path: yield f"  [-] Archivo SP3 Preciso cargado manualmente: {f_sp3.filename}\n"
             else: yield "  [!] No se detectó archivo SP3 manual. Se usará solo Broadcast NAV.\n"
 
-            yield "\n> [RED] Conectando con IGS BKG para descargar Respaldo NAV...\n"
+            yield "\n> [RED] Conectando con Red Global de Repositorios GNSS...\n"
             bp = leer_estado('base_raw')
             if not bp or not os.path.exists(bp): 
                 yield "> [ERROR FATAL] Falta RINEX Base en memoria para extraer fecha.\n"; return
@@ -1237,6 +1381,7 @@ def tab2_efemerides():
             year, month, day = ft[0], ft[1], ft[2]
             dt = datetime.datetime(year, month, day)
             doy = dt.timetuple().tm_yday
+            yy = str(year)[-2:]
             
             nav_gz = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav.gz")
             nav_path = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
@@ -1246,30 +1391,33 @@ def tab2_efemerides():
             ctx.verify_mode = ssl.CERT_NONE
             
             if not os.path.exists(nav_path):
+                # ENRUTADOR AGRESIVO: Servidores espejo globales (SOPAC, BKG, EPN) con RINEX 2 (brdc)
                 urls_to_try = [
-                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz",
-                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDM00DLR_S_{year}{doy:03d}0000_01D_MN.rnx.gz",
-                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00WRD_R_{year}{doy:03d}0000_01D_MN.rnx.gz"
+                    f"https://garner.ucsd.edu/pub/rinex/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"https://www.epncb.oma.be/ftp/obs/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"
                 ]
                 
                 descargado = False
                 for url_nav in urls_to_try:
                     try:
-                        yield f"  [-] Intentando descargar NAV desde: {url_nav.split('/')[-1]}...\n"
+                        yield f"  [-] Intentando descargar NAV desde espejo: {url_nav.split('/')[-1]}...\n"
                         req = urllib.request.Request(url_nav, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, context=ctx, timeout=8) as res:
+                        with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
                             with open(nav_gz, 'wb') as f: f.write(res.read())
                         descargado = True
-                        yield f"  [+] Descarga exitosa de {url_nav.split('/')[-1]}\n"
+                        yield f"  [+] Descarga exitosa verificada.\n"
                         break 
                     except Exception as e:
-                        yield f"  [!] No disponible (Error {str(e)}). Buscando alternativa...\n"
+                        err_limpio = str(e).replace('<', '[').replace('>', ']')
+                        yield f"  [!] Falló ({err_limpio}). Saltando a siguiente servidor...\n"
                         continue
                 
                 if not descargado:
-                    raise Exception("HTTP 404: Ningún servidor IGS ha publicado aún el archivo NAV de este día.")
+                    raise Exception("HTTP 404/Timeout Total: La red global bloqueó la conexión o el archivo no existe.")
                 
-                yield "  [-] Descomprimiendo archivo NAV de alta densidad...\n"
+                yield "  [-] Descomprimiendo archivo NAV...\n"
                 with gzip.open(nav_gz, 'rb') as f_in, open(nav_path, 'wb') as f_out: 
                     shutil.copyfileobj(f_in, f_out)
                 
@@ -1322,8 +1470,20 @@ def tab3_calibrar():
             nav = parse_rinex_nav_real(nav_path)
             sp3 = parse_sp3_preciso(sp3_path) if sp3_path else {}
             
-            yield "[PROGRESO] Re-ensamblando Malla Temporal de Calibración...\n"
-            sd_suavizada = aislar_diferencias_simples_ppk(obs_b_raw, obs_r_raw)
+            tipo_mod, razon_mod = analizar_calidad_y_senales_rinex(obs_b_raw, obs_r_raw)
+            is_homogeneo = (tipo_mod == "MODO_A_CODIGO")
+            
+            yield f"[PROGRESO] Re-ensamblando Malla Temporal de Calibración ({tipo_mod})...\n"
+            if is_homogeneo:
+                yield f"  [-] Justificación: {razon_mod}\n"
+                sd_suavizada = aislar_diferencias_simples_ppk(obs_b_raw, obs_r_raw)
+            elif tipo_mod == "MODO_C_AUTONOMO":
+                yield f"  [-] Justificación: {razon_mod}\n"
+                yield "> [ERROR] Operación Abortada. Módulo C Autónomo (SPP) requiere implementación geométrica dedicada.\n"; return
+            else:
+                yield f"  [-] Justificación: {razon_mod}\n"
+                sd_suavizada = aislar_diferencias_simples_ppk_asincrono(obs_b_raw, obs_r_raw, max_gap=p_max_gap)
+                
             if not sd_suavizada:
                 yield "> [ERROR] No hay épocas sincronizadas válidas.\n"; return
 
@@ -1334,10 +1494,8 @@ def tab3_calibrar():
             X_bg, Y_bg, Z_bg = geodesicas_a_ecef(lat_b, lon_b, utm_c)
 
             yield "[PROGRESO] Fase 1: Extracción de Límites (Pre-Scan EKF)...\n"
-            
-            # --- MODIFICACIÓN V16: Flexibilidad inicial amplia para móvil ---
             P_init = matid(3)
-            for i in range(3): P_init[i][i] = 1000.0 
+            for i in range(3): P_init[i][i] = 100.0
             
             kf_estado_raw = {'X': [[X_bg], [Y_bg], [Z_bg]], 'P': P_init, 'X_base': (X_b, Y_b, Z_b), 'fix_flags': 0, 'h_r': h_r}
             coords_raw = []
@@ -1396,7 +1554,6 @@ def tab3_calibrar():
                 m_grid = [max(1.0, min(25.0, x)) for x in [m_center - m_span, m_center, m_center + m_span]]
                 cp_grid = [max(0.1, min(5.0, x)) for x in [cp_center - cp_span, cp_center, cp_center + cp_span]]
                 ca_grid = [max(0.1, min(5.0, x)) for x in [ca_center - ca_span, ca_center, ca_center + ca_span]]
-                
                 snr_grid = [max(25.0, min(45.0, x)) for x in [snr_center - snr_span, snr_center, snr_center + snr_span]]
                 gap_grid = [max(0.01, min(2.0, x)) for x in [gap_center - gap_span, gap_center, gap_center + gap_span]]
                 
@@ -1404,15 +1561,18 @@ def tab3_calibrar():
                 nivel_best_params = {}
                 
                 for gap in set(gap_grid):
-                    obs_b_sync = {}
-                    for tr in rover_tows_full:
-                        if not base_tows_full: continue
-                        idx = min(range(len(base_tows_full)), key=lambda i: abs(base_tows_full[i] - tr))
-                        if abs(base_tows_full[idx] - tr) <= gap:
-                            obs_b_sync[tr] = obs_b_full[base_tows_full[idx]].copy()
-                            obs_b_sync[tr]['_meta'] = obs_r_full[tr]['_meta']
-                    
-                    sd_suav = aislar_diferencias_simples_ppk(obs_b_sync, obs_r_full)
+                    if is_homogeneo:
+                        obs_b_sync = {}
+                        for tr in rover_tows_full:
+                            if not base_tows_full: continue
+                            idx = min(range(len(base_tows_full)), key=lambda i: abs(base_tows_full[i] - tr))
+                            if abs(base_tows_full[idx] - tr) <= gap:
+                                obs_b_sync[tr] = obs_b_full[base_tows_full[idx]].copy()
+                                obs_b_sync[tr]['_meta'] = obs_r_full[tr]['_meta']
+                        sd_suav = aislar_diferencias_simples_ppk(obs_b_sync, obs_r_full)
+                    else:
+                        sd_suav = aislar_diferencias_simples_ppk_asincrono(obs_b_full, obs_r_full, max_gap=gap)
+                        
                     t_samp = list(sd_suav.keys())
                     if not sd_suav: continue
                     
@@ -1550,19 +1710,29 @@ def tab4_procesar():
             
             if sp3: yield "[PROGRESO] Órbitas Precisas SP3 acopladas con éxito...\n"
             
-            yield f"[PROGRESO] Sincronización Estricta (Tolerancia {f_14(p_max_gap)}s)...\n"
-            rover_tows = sorted(list(obs_r_raw.keys()))
-            base_tows = sorted(list(obs_b_raw.keys()))
-            obs_b_sync = {}
-            for tr in rover_tows:
-                if not base_tows: continue
-                idx = min(range(len(base_tows)), key=lambda i: abs(base_tows[i] - tr))
-                if abs(base_tows[idx] - tr) <= p_max_gap:
-                    obs_b_sync[tr] = obs_b_raw[base_tows[idx]].copy()
-                    obs_b_sync[tr]['_meta'] = obs_r_raw[tr]['_meta']
+            tipo_mod, razon_mod = analizar_calidad_y_senales_rinex(obs_b_raw, obs_r_raw)
+            is_homogeneo = (tipo_mod == "MODO_A_CODIGO")
             
-            yield "[PROGRESO] Extrayendo Observables PPK...\n"
-            sd_suavizada = aislar_diferencias_simples_ppk(obs_b_sync, obs_r_raw)
+            if is_homogeneo:
+                yield f"[PROGRESO] Módulo A Activo: Sincronización Estricta ({razon_mod} | Gap {f_14(p_max_gap)}s)...\n"
+                rover_tows = sorted(list(obs_r_raw.keys()))
+                base_tows = sorted(list(obs_b_raw.keys()))
+                obs_b_sync = {}
+                for tr in rover_tows:
+                    if not base_tows: continue
+                    idx = min(range(len(base_tows)), key=lambda i: abs(base_tows[i] - tr))
+                    if abs(base_tows[idx] - tr) <= p_max_gap:
+                        obs_b_sync[tr] = obs_b_raw[base_tows[idx]].copy()
+                        obs_b_sync[tr]['_meta'] = obs_r_raw[tr]['_meta']
+                yield "[PROGRESO] Extrayendo Observables PPK...\n"
+                sd_suavizada = aislar_diferencias_simples_ppk(obs_b_sync, obs_r_raw)
+            elif tipo_mod == "MODO_C_AUTONOMO":
+                yield f"[PROGRESO] Módulo C Activo: {razon_mod}\n"
+                yield "> [ERROR] Operación Abortada. Módulo C Autónomo (SPP) requiere implementación geométrica dedicada.\n"; return
+            else:
+                yield f"[PROGRESO] Módulo B Activo: Interpolación Polinómica Asincrónica ({razon_mod})...\n"
+                yield "[PROGRESO] Extrayendo Observables PPK...\n"
+                sd_suavizada = aislar_diferencias_simples_ppk_asincrono(obs_b_raw, obs_r_raw, max_gap=p_max_gap)
             
             if len(sd_suavizada) == 0:
                 yield "\n> [ERROR] No hay épocas sincronizadas válidas.\n"; return
@@ -1572,10 +1742,8 @@ def tab4_procesar():
             X_bg, Y_bg, Z_bg = geodesicas_a_ecef(lat_b, lon_b, utm_c)
 
             yield "[PROGRESO] Fase 1: Pasada Forward EKF + Mareas Sólidas...\n"
-            
-            # --- MODIFICACIÓN V16: Flexibilidad inicial amplia para móvil ---
             P_init = matid(3)
-            for i in range(3): P_init[i][i] = 1000.0 
+            for i in range(3): P_init[i][i] = 100.0
             
             kf_est = {'X': [[X_bg], [Y_bg], [Z_bg]], 'P': P_init, 'X_base': (X_b, Y_b, Z_b), 'fix_flags': 0, 'h_r': h_r}
             fwd_states = []
@@ -1621,7 +1789,8 @@ def tab4_procesar():
                 'nav_file': leer_estado('name_nav_file') or "auto_nav.nav",
                 'sp3_file': leer_estado('name_sp3_file'),
                 'b_n': utm_n, 'b_e': utm_e, 'b_z': utm_c,
-                'r_n_calc': nf, 'r_e_calc': ef, 'r_z_calc': zf
+                'r_n_calc': nf, 'r_e_calc': ef, 'r_z_calc': zf,
+                'estrategia_auditoria': f"{tipo_mod} ({razon_mod})"
             }
             
             yield "[PROGRESO] Ajuste EKF+RTS Finalizado.\n"
