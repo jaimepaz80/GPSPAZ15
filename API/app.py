@@ -748,7 +748,7 @@ def interpolar_observables_base(obs_b, t_target, max_gap=0.5):
     for i in range(1, len(pts_t)):
         if pts_t[i] - pts_t[i-1] > 10.0: return None
             
-    # CORRECCIÓN DE INDICE: Usar tows[idx] en lugar de pts_t[idx] para evitar el 'list index out of range'
+    # CORRECCIÓN DE ÍNDICE: Referencia directa a la matriz absoluta tows[idx]
     base_interp = {'_meta': obs_b[tows[idx]]['_meta']}
     sats_in_all = set(obs_b[pts_t[0]].keys())
     for t in pts_t[1:]: sats_in_all.intersection_update(set(obs_b[t].keys()))
@@ -761,16 +761,18 @@ def interpolar_observables_base(obs_b, t_target, max_gap=0.5):
             valid = True
             y_pts = []
             for t in pts_t:
-                if obs_type not in obs_b[t]:
+                # FIX CRÍTICO: Búsqueda exacta dentro de la capa del satélite
+                if obs_type not in obs_b[t][sat]:
                     valid = False
                     break
-                y_pts.append(obs_b[t][obs_type])
+                y_pts.append(obs_b[t][sat][obs_type])
                 
             if valid:
                 if obs_type in ['L1', 'L5']:
                     slip = False
                     for i in range(1, len(y_pts)):
-                        if abs(y_pts[i] - y_pts[i-1]) > 500.0: slip = True
+                        # FIX CRÍTICO: Umbral Doppler calibrado a la física real (50000 ciclos)
+                        if abs(y_pts[i] - y_pts[i-1]) > 50000.0: slip = True
                     if slip: continue
                 data_interp[obs_type] = lagrange_interpolate(t_target, pts_t, y_pts)
                 
@@ -1416,12 +1418,13 @@ def tab2_efemerides():
                 descargado = False
                 for url_nav in urls_to_try:
                     try:
-                        yield f"  [-] Intentando descargar NAV desde espejo: {url_nav.split('/')[-1]}...\n"
+                        protocolo = "HTTP PURO" if url_nav.startswith("http://") else "HTTPS"
+                        yield f"  [-] Intentando espejo ({protocolo}): {url_nav.split('/')[-1]}...\n"
                         req = urllib.request.Request(url_nav, headers={'User-Agent': 'Mozilla/5.0'})
                         with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
                             with open(nav_gz, 'wb') as f: f.write(res.read())
                         descargado = True
-                        yield f"  [+] Descarga exitosa verificada.\n"
+                        yield f"  [+] Descarga exitosa verificada mediante {protocolo}.\n"
                         break 
                     except Exception as e:
                         err_limpio = str(e).replace('<', '[').replace('>', ']')
