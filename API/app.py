@@ -185,7 +185,6 @@ def invert_matrix_nxn(M):
         return matmul(transpose_matrix(L_inv), L_inv)
     except:
         return gauss_jordan_inverse(M)
-
 # =====================================================================
 # PARSERS Y GESTIÓN DE ARCHIVOS
 # =====================================================================
@@ -205,7 +204,8 @@ def parse_rinex_obs_completo(path):
                     if sys_char: last_sys_char = sys_char
                     if last_sys_char:
                         tokens = [x.strip() for x in line[6:60].split() if x.strip()]
-                        sys_tokens.setdefault(last_sys_char, []).extend(tokens)
+                        if last_sys_char not in sys_tokens: sys_tokens[last_sys_char] = []
+                        sys_tokens[last_sys_char].extend(tokens)
                 elif "END OF HEADER" in line: 
                     in_h = False
                     for sc, t in sys_tokens.items():
@@ -254,14 +254,16 @@ def parse_rinex_obs_completo(path):
                 
                 valid_p = ('C1' in data and data['C1'] > 15000000.0) or ('C5' in data and data['C5'] > 15000000.0)
                 if valid_p:
-                    obs.setdefault(tow, {})[line[0:3].strip()] = data
+                    if tow not in obs: obs[tow] = {}
+                    obs[tow][line[0:3].strip()] = data
     return obs
 
 def interpolar_base_a_rover(obs_base, tr, max_gap=0.05):
     tiempos_base = sorted(list(obs_base.keys()))
     if not tiempos_base: return None
     idx = min(range(len(tiempos_base)), key=lambda i: abs(tiempos_base[i] - tr))
-    if abs(tiempos_base[idx] - tr) <= max_gap: return obs_base[tiempos_base[idx]].copy()
+    if abs(tiempos_base[idx] - tr) <= max_gap:
+        return obs_base[tiempos_base[idx]].copy()
     return None
 
 def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
@@ -272,7 +274,12 @@ def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
             header_lines.append(line)
             if "END OF HEADER" in line: break
     
-    idx = next((i for i, l in enumerate(header_lines) if "END OF HEADER" in l), -1)
+    idx = -1
+    for i, l in enumerate(header_lines):
+        if "END OF HEADER" in l:
+            idx = i
+            break
+            
     if idx != -1:
         constelaciones_requeridas = ['G', 'E', 'C', 'R', 'S', 'J']
         offset = 0
@@ -285,12 +292,15 @@ def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
         for tow in sorted(obs_dict.keys()):
             meta = obs_dict[tow].get('_meta')
             if not meta: continue
-            y, m, d, h, mn, sec = meta
+            y, m, d, h, mn, sec = meta[0], meta[1], meta[2], meta[3], meta[4], meta[5]
             sats = [k for k in obs_dict[tow].keys() if k != '_meta']
             f_out.write(f"> {y} {m:02d} {d:02d} {h:02d} {mn:02d} {sec:11.7f}  0 {len(sats):2d}\n")
+            
             for sat in sats:
-                c1, l1 = obs_dict[tow][sat].get('C1', 0.0), obs_dict[tow][sat].get('L1', 0.0)
-                c5, l5 = obs_dict[tow][sat].get('C5', 0.0), obs_dict[tow][sat].get('L5', 0.0)
+                c1 = obs_dict[tow][sat].get('C1', 0.0)
+                l1 = obs_dict[tow][sat].get('L1', 0.0)
+                c5 = obs_dict[tow][sat].get('C5', 0.0)
+                l5 = obs_dict[tow][sat].get('L5', 0.0)
                 c1_s = f"{c1:14.3f}" if c1 > 0 else "              "
                 l1_s = f"{l1:14.3f}" if l1 > 0 else "              "
                 c5_s = f"{c5:14.3f}" if c5 > 0 else "              "
@@ -305,7 +315,8 @@ def obtener_fecha_obs(filepath):
                 if len(partes) >= 6: 
                     try:
                         y = int(partes[0])
-                        return (y if y>100 else y+2000), int(partes[1]), int(partes[2]), int(partes[3]), int(partes[4]), float(partes[5])
+                        year = y if y > 100 else y + 2000
+                        return year, int(partes[1]), int(partes[2]), int(partes[3]), int(partes[4]), float(partes[5])
                     except: pass
     return None
 
@@ -337,14 +348,16 @@ def parse_sp3_preciso(path):
                         x = float(line[4:18]) * 1000.0
                         y = float(line[18:32]) * 1000.0
                         z = float(line[32:46]) * 1000.0
-                        clk = float(line[46:60]) / 1e6 if len(line)>46 and line[46:60].strip() else 0.0
-                        sp3_data.setdefault(sat_id, []).append((current_time, x, y, z, clk))
+                        clk = float(line[46:60]) / 1e6 if len(line) > 46 and line[46:60].strip() else 0.0
+                        if sat_id not in sp3_data: sp3_data[sat_id] = []
+                        sp3_data[sat_id].append((current_time, x, y, z, clk))
                     except: pass
     for sat in sp3_data: sp3_data[sat].sort(key=lambda item: item[0])
     return sp3_data
 
 def lagrange_interpolate(x, x_pts, y_pts):
-    n = len(x_pts); val = 0.0
+    n = len(x_pts)
+    val = 0.0
     for i in range(n):
         p = 1.0
         for j in range(n):
@@ -355,49 +368,45 @@ def lagrange_interpolate(x, x_pts, y_pts):
 def interpolate_sp3(sp3_data, sat, t_emision, degree=9):
     global SP3_CACHE, SP3_CACHE_KEYS
     cache_key = f"{sat}_{t_emision}"
-    
     with SP3_LOCK:
-        if cache_key in SP3_CACHE:
-            return SP3_CACHE[cache_key]
+        if cache_key in SP3_CACHE: return SP3_CACHE[cache_key]
 
     if sat not in sp3_data: return None
     data = sp3_data[sat]
     if len(data) < degree + 1: return None
     
     idx = min(range(len(data)), key=lambda i: abs(data[i][0] - t_emision))
-    
     half = degree // 2
     start = max(0, idx - half)
     end = min(len(data), start + degree + 1)
     if end - start < degree + 1: start = max(0, end - degree - 1)
+        
     pts = data[start:end]
-    
-    t_pts = [p[0] for p in pts]; x_pts = [p[1] for p in pts]
-    y_pts = [p[2] for p in pts]; z_pts = [p[3] for p in pts]
+    t_pts, x_pts, y_pts, z_pts = [], [], [], []
+    for p in pts:
+        t_pts.append(p[0]); x_pts.append(p[1]); y_pts.append(p[2]); z_pts.append(p[3])
     
     start_clk = max(0, idx - 1)
     end_clk = min(len(data), start_clk + 2)
     if end_clk - start_clk < 2: start_clk = max(0, end_clk - 2)
     pts_clk = data[start_clk:end_clk]
-    t_pts_clk = [p[0] for p in pts_clk]; clk_pts = [p[4] for p in pts_clk]
+    t_pts_clk, clk_pts = [], []
+    for p in pts_clk:
+        t_pts_clk.append(p[0]); clk_pts.append(p[4])
     
-    result = (
-        lagrange_interpolate(t_emision, t_pts, x_pts),
-        lagrange_interpolate(t_emision, t_pts, y_pts),
-        lagrange_interpolate(t_emision, t_pts, z_pts),
-        lagrange_interpolate(t_emision, t_pts_clk, clk_pts)
-    )
+    val_x = lagrange_interpolate(t_emision, t_pts, x_pts)
+    val_y = lagrange_interpolate(t_emision, t_pts, y_pts)
+    val_z = lagrange_interpolate(t_emision, t_pts, z_pts)
+    val_clk = lagrange_interpolate(t_emision, t_pts_clk, clk_pts)
+    result = (val_x, val_y, val_z, val_clk)
     
     with SP3_LOCK:
         if len(SP3_CACHE) >= MAX_CACHE_SIZE:
             oldest_key = SP3_CACHE_KEYS.pop(0)
             SP3_CACHE.pop(oldest_key, None)
-            
         SP3_CACHE[cache_key] = result
         SP3_CACHE_KEYS.append(cache_key)
-    
     return result
-
 def parse_rinex_nav_real(path):
     ephemeris = {'_iono': {'alpha': [0]*4, 'beta': [0]*4}}
     if not path or not os.path.exists(path): return ephemeris
@@ -739,7 +748,8 @@ def interpolar_observables_base(obs_b, t_target, max_gap=0.5):
     for i in range(1, len(pts_t)):
         if pts_t[i] - pts_t[i-1] > 10.0: return None
             
-    base_interp = {'_meta': obs_b[pts_t[idx]]['_meta']}
+    # CORRECCIÓN DE INDICE: Usar tows[idx] en lugar de pts_t[idx] para evitar el 'list index out of range'
+    base_interp = {'_meta': obs_b[tows[idx]]['_meta']}
     sats_in_all = set(obs_b[pts_t[0]].keys())
     for t in pts_t[1:]: sats_in_all.intersection_update(set(obs_b[t].keys()))
         
@@ -1066,7 +1076,6 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
 
     except Exception as e:
         return None, f"FAILED_EXCEPTION:_{str(e)}", kf_estado, None
-
 # =====================================================================
 # ESTADÍSTICAS Y FILTRADO VINCULANTE
 # =====================================================================
@@ -1312,6 +1321,7 @@ def tab1_homogenizar():
             base_raw_dict = parse_rinex_obs_completo(p_b_raw)
             rover_raw_dict = parse_rinex_obs_completo(p_r_raw)
             
+            # INYECCIÓN DEL ENRUTADOR INTELIGENTE (MÓDULOS A, B, C)
             tipo_mod, razon_mod = analizar_calidad_y_senales_rinex(base_raw_dict, rover_raw_dict)
             guardar_estado('estrategia_auditoria', f"{tipo_mod}: {razon_mod}")
             
@@ -1384,7 +1394,7 @@ def tab2_efemerides():
             year, month, day = ft[0], ft[1], ft[2]
             dt = datetime.datetime(year, month, day)
             doy = dt.timetuple().tm_yday
-            yy = str(year)[-2:]
+            yy = str(year)[-2:] # Extracción de los 2 últimos dígitos para el formato Legacy brdc
             
             nav_gz = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav.gz")
             nav_path = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
@@ -1394,38 +1404,32 @@ def tab2_efemerides():
             ctx.verify_mode = ssl.CERT_NONE
             
             if not os.path.exists(nav_path):
-                # ENRUTADOR AGRESIVO Y BYPASS SSL:
+                # ENRUTADOR AGRESIVO: Servidores espejo globales usando formato ultraligero RINEX 2 (brdc)
+                # (Se incluye HTTP puro para BKG para evadir su fallo de certificado SSL)
                 urls_to_try = [
-                    # 1. Intentos HTTPS (Seguros - Si los certificados funcionan)
                     f"https://garner.ucsd.edu/pub/rinex/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
-                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
-                    f"https://www.epncb.oma.be/ftp/obs/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
-                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz",
-                    # 2. BYPASS DE CERTIFICADO (HTTP Puro por puerto 80 para saltar el error SSL)
-                    f"http://garner.ucsd.edu/pub/rinex/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
                     f"http://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
-                    f"http://www.epncb.oma.be/ftp/obs/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"https://www.epncb.oma.be/ftp/obs/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
                     f"http://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"
                 ]
                 
                 descargado = False
                 for url_nav in urls_to_try:
                     try:
-                        protocolo = "HTTP PURO" if url_nav.startswith("http://") else "HTTPS"
-                        yield f"  [-] Intentando espejo ({protocolo}): {url_nav.split('/')[-1]}...\n"
+                        yield f"  [-] Intentando descargar NAV desde espejo: {url_nav.split('/')[-1]}...\n"
                         req = urllib.request.Request(url_nav, headers={'User-Agent': 'Mozilla/5.0'})
                         with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
                             with open(nav_gz, 'wb') as f: f.write(res.read())
                         descargado = True
-                        yield f"  [+] Descarga exitosa verificada mediante {protocolo}.\n"
+                        yield f"  [+] Descarga exitosa verificada.\n"
                         break 
                     except Exception as e:
                         err_limpio = str(e).replace('<', '[').replace('>', ']')
-                        yield f"  [!] Falló ({err_limpio}). Saltando a siguiente pasarela...\n"
+                        yield f"  [!] Falló ({err_limpio}). Saltando a siguiente servidor...\n"
                         continue
                 
                 if not descargado:
-                    raise Exception("Fallo Total: Bloqueo geográfico de IGS o archivos no existen para la fecha en repositorios.")
+                    raise Exception("HTTP 404/Timeout Total: La red IGS global bloqueó la conexión o el archivo no existe.")
                 
                 yield "  [-] Descomprimiendo archivo NAV...\n"
                 with gzip.open(nav_gz, 'rb') as f_in, open(nav_path, 'wb') as f_out: 
@@ -1480,6 +1484,7 @@ def tab3_calibrar():
             nav = parse_rinex_nav_real(nav_path)
             sp3 = parse_sp3_preciso(sp3_path) if sp3_path else {}
             
+            # INYECCIÓN DEL ENRUTADOR INTELIGENTE
             tipo_mod, razon_mod = analizar_calidad_y_senales_rinex(obs_b_raw, obs_r_raw)
             is_homogeneo = (tipo_mod == "MODO_A_CODIGO")
             
@@ -1571,6 +1576,7 @@ def tab3_calibrar():
                 nivel_best_params = {}
                 
                 for gap in set(gap_grid):
+                    # INYECCIÓN DEL ENRUTADOR DENTRO DEL LOOP DE BÚSQUEDA
                     if is_homogeneo:
                         obs_b_sync = {}
                         for tr in rover_tows_full:
@@ -1720,6 +1726,7 @@ def tab4_procesar():
             
             if sp3: yield "[PROGRESO] Órbitas Precisas SP3 acopladas con éxito...\n"
             
+            # INYECCIÓN DEL ENRUTADOR INTELIGENTE
             tipo_mod, razon_mod = analizar_calidad_y_senales_rinex(obs_b_raw, obs_r_raw)
             is_homogeneo = (tipo_mod == "MODO_A_CODIGO")
             
