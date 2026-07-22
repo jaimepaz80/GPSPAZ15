@@ -697,7 +697,8 @@ def aislar_diferencias_simples_ppk(obs_b, obs_r):
         
         use_l5 = (l5_count >= 4) or (l5_count >= l1_count and l5_count >= 3)
         
-        sd_epoca = {'_meta': obs_r[tow]['_meta']}
+        # INYECCIÓN: Se incrusta explícitamente tow_b para igualar estructura física
+        sd_epoca = {'_meta': obs_r[tow]['_meta'], '_tow_b': tow}
         for s, d_r in obs_r[tow].items():
             if s == '_meta' or s not in obs_b[tow]: continue
             d_b = obs_b[tow][s]
@@ -725,79 +726,40 @@ def aislar_diferencias_simples_ppk(obs_b, obs_r):
                 'snr': min(snr_b, snr_r),
                 'sys': s[0]
             }
-        if len(sd_epoca) > 1: sd_suavizada[tow] = sd_epoca
+        if len(sd_epoca) > 2: sd_suavizada[tow] = sd_epoca
     return sd_suavizada
 
 # =====================================================================
-# MOTOR PPK HÍBRIDO ASINCRÓNICO - MÓDULO B
+# MOTOR PPK HÍBRIDO ASINCRÓNICO - MÓDULO B (SIN INTERPOLACIÓN)
 # =====================================================================
-def interpolar_observables_base(obs_b, t_target, max_gap=0.5):
+def obtener_base_cercana(obs_b, t_target, max_gap=0.5):
     tows = sorted(list(obs_b.keys()))
-    if len(tows) < 4: return None
-        
+    if not tows: return None, None
     idx = min(range(len(tows)), key=lambda i: abs(tows[i] - t_target))
-    if abs(tows[idx] - t_target) > max_gap: return None
-        
-    start = max(0, idx - 2)
-    end = min(len(tows), start + 4)
-    if end - start < 4: start = max(0, end - 4)
-        
-    pts_t = tows[start:end]
-    if len(pts_t) < 4: return None
-        
-    for i in range(1, len(pts_t)):
-        if pts_t[i] - pts_t[i-1] > 10.0: return None
-            
-    # CORRECCIÓN DE ÍNDICE: Referencia directa a la matriz absoluta tows[idx]
-    base_interp = {'_meta': obs_b[tows[idx]]['_meta']}
-    sats_in_all = set(obs_b[pts_t[0]].keys())
-    for t in pts_t[1:]: sats_in_all.intersection_update(set(obs_b[t].keys()))
-        
-    if '_meta' in sats_in_all: sats_in_all.remove('_meta')
-        
-    for sat in sats_in_all:
-        data_interp = {}
-        for obs_type in ['C1', 'L1', 'C5', 'L5', 'S1', 'S5']:
-            valid = True
-            y_pts = []
-            for t in pts_t:
-                # FIX CRÍTICO: Búsqueda exacta dentro de la capa del satélite
-                if obs_type not in obs_b[t][sat]:
-                    valid = False
-                    break
-                y_pts.append(obs_b[t][sat][obs_type])
-                
-            if valid:
-                if obs_type in ['L1', 'L5']:
-                    slip = False
-                    for i in range(1, len(y_pts)):
-                        # FIX CRÍTICO: Umbral Doppler calibrado a la física real (50000 ciclos)
-                        if abs(y_pts[i] - y_pts[i-1]) > 50000.0: slip = True
-                    if slip: continue
-                data_interp[obs_type] = lagrange_interpolate(t_target, pts_t, y_pts)
-                
-        if data_interp: base_interp[sat] = data_interp
-    return base_interp
+    if abs(tows[idx] - t_target) > max_gap: return None, None
+    return tows[idx], obs_b[tows[idx]]
 
 def aislar_diferencias_simples_ppk_asincrono(obs_b_full, obs_r, max_gap=0.5):
     sd_suavizada = {}
-    for tow in sorted(list(obs_r.keys())):
-        base_interp = interpolar_observables_base(obs_b_full, tow, max_gap)
-        if not base_interp: continue
+    for tow_r in sorted(list(obs_r.keys())):
+        tow_b, base_cercana = obtener_base_cercana(obs_b_full, tow_r, max_gap)
+        if not base_cercana: continue
             
         l1_count, l5_count = 0, 0
-        for s, d_r in obs_r[tow].items():
-            if s == '_meta' or s not in base_interp: continue
-            d_b = base_interp[s]
+        for s, d_r in obs_r[tow_r].items():
+            if s == '_meta' or s not in base_cercana: continue
+            d_b = base_cercana[s]
             if d_b.get('C5') and d_r.get('C5') and d_b.get('L5') and d_r.get('L5'): l5_count += 1
             if d_b.get('C1') and d_r.get('C1') and d_b.get('L1') and d_r.get('L1'): l1_count += 1
                 
         use_l5 = (l5_count >= 4) or (l5_count >= l1_count and l5_count >= 3)
-        sd_epoca = {'_meta': obs_r[tow]['_meta']}
         
-        for s, d_r in obs_r[tow].items():
-            if s == '_meta' or s not in base_interp: continue
-            d_b = base_interp[s]
+        # INYECCIÓN: Se incrusta tow_b para cálculo cinemático doble posterior
+        sd_epoca = {'_meta': obs_r[tow_r]['_meta'], '_tow_b': tow_b}
+        
+        for s, d_r in obs_r[tow_r].items():
+            if s == '_meta' or s not in base_cercana: continue
+            d_b = base_cercana[s]
             pr_b, pr_r, cp_b, cp_r, wave_sys = None, None, None, None, None
             
             if use_l5 and d_b.get('C5') and d_r.get('C5'):
@@ -822,7 +784,7 @@ def aislar_diferencias_simples_ppk_asincrono(obs_b_full, obs_r, max_gap=0.5):
                 'snr': min(snr_b, snr_r),
                 'sys': s[0]
             }
-        if len(sd_epoca) > 1: sd_suavizada[tow] = sd_epoca
+        if len(sd_epoca) > 2: sd_suavizada[tow_r] = sd_epoca
     return sd_suavizada
 
 def decorrelacion_lambda_z(Q):
@@ -873,6 +835,9 @@ def suavizador_rts_backward(forward_states):
 
 def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask):
     try:
+        # EXTRACCIÓN CRÍTICA: Recuperar tiempo exacto de la Base para cálculos de cinemática
+        tow_b = sd_epoca.get('_tow_b', tr)
+        
         X_pri = [[kf_estado['X'][0][0]], [kf_estado['X'][1][0]], [kf_estado['X'][2][0]]]
         P_pri = [row[:] for row in kf_estado['P']]
         h_r = kf_estado.get('h_r', 0.0)
@@ -894,9 +859,11 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         beta = nav.get('_iono', {}).get('beta', [0]*4)
         
         y_m, m_m, d_m, h_m, mn_m, sec_m = sd_epoca['_meta']
+        
+        # Mareas Sólidas evaluadas en el tiempo de la base
         dx_tide, dy_tide, dz_tide = correccion_mareas_solidas(
             kf_estado['X_base'][0], kf_estado['X_base'][1], kf_estado['X_base'][2], 
-            tr, y_m, m_m, d_m
+            tow_b, y_m, m_m, d_m
         )
         
         X_base_corr = kf_estado['X_base'][0] + dx_tide
@@ -907,11 +874,13 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         
         sat_positions = {}
         for s, d in sd_epoca.items():
-            if s == '_meta' or d['sd_P'] is None: continue 
+            if s == '_meta' or s == '_tow_b' or d['sd_P'] is None: continue 
             tau_r = d['pr_r'] / C_LIGHT
             tau_b = d['pr_b'] / C_LIGHT
+            
+            # CINEMÁTICA ASINCRÓNICA: Tiempo de emisión exacto para Rover y Base independientemente
             t_emision_r = tr - tau_r
-            t_emision_b = tr - tau_b
+            t_emision_b = tow_b - tau_b
             
             sp_r, sp_b = None, None
             
@@ -955,17 +924,17 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         
         if len(sat_list) < 3: return None, "FAILED", kf_estado, None
         
-        def calc_rho(sp, X, Y, Z, lat, lon, alt, el, az, wave):
+        def calc_rho(sp, X, Y, Z, lat, lon, alt, el, az, wave, t_eval):
             dist = math.sqrt((sp[0]-X)**2 + (sp[1]-Y)**2 + (sp[2]-Z)**2)
             tropo = calcular_saastamoinen(lat, alt, el)
-            iono_m = calcular_klobuchar(lat, lon, el, az, tr, alpha, beta)
+            iono_m = calcular_klobuchar(lat, lon, el, az, t_eval, alpha, beta)
             if wave == WAVE_L5: iono_m *= 1.79327 
             return dist + tropo, iono_m, dist
 
         base_calcs = {}
         for s, data in sat_positions.items():
             el_b, az_b = calcular_topocentricas(data['sp_b'][0], data['sp_b'][1], data['sp_b'][2], X_base_corr, Y_base_corr, Z_base_corr)
-            rho_b, iono_b, dist_b = calc_rho(data['sp_b'], X_base_corr, Y_base_corr, Z_base_corr, lat_base, lon_base, alt_base, el_b, az_b, data['wave'])
+            rho_b, iono_b, dist_b = calc_rho(data['sp_b'], X_base_corr, Y_base_corr, Z_base_corr, lat_base, lon_base, alt_base, el_b, az_b, data['wave'], tow_b)
             base_calcs[s] = {'P': rho_b + iono_b, 'CP': rho_b - iono_b}
 
         H = []; L = []; R_diag = []
@@ -974,7 +943,7 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
         for c, r_sat in ref_sats.items():
             r_data = sat_positions[r_sat]
             el_r, az_r = calcular_topocentricas(r_data['sp_r'][0], r_data['sp_r'][1], r_data['sp_r'][2], X_apc, Y_apc, Z_apc)
-            rho_r, iono_r, dist_r = calc_rho(r_data['sp_r'], X_apc, Y_apc, Z_apc, lat_r, lon_r, alt_r + h_r, el_r, az_r, r_data['wave'])
+            rho_r, iono_r, dist_r = calc_rho(r_data['sp_r'], X_apc, Y_apc, Z_apc, lat_r, lon_r, alt_r + h_r, el_r, az_r, r_data['wave'], tr)
             
             SD_P_calc_ref = (rho_r + iono_r) - base_calcs[r_sat]['P']
             SD_CP_calc_ref = (rho_r - iono_r) - base_calcs[r_sat]['CP']
@@ -987,7 +956,7 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
             rc = c_ref[c]
             
             el_i_r, az_i_r = calcular_topocentricas(data['sp_r'][0], data['sp_r'][1], data['sp_r'][2], X_apc, Y_apc, Z_apc)
-            rho_i_r, iono_i_r, dist_i_r = calc_rho(data['sp_r'], X_apc, Y_apc, Z_apc, lat_r, lon_r, alt_r + h_r, el_i_r, az_i_r, data['wave'])
+            rho_i_r, iono_i_r, dist_i_r = calc_rho(data['sp_r'], X_apc, Y_apc, Z_apc, lat_r, lon_r, alt_r + h_r, el_i_r, az_i_r, data['wave'], tr)
             
             SD_P_calc_i = (rho_i_r + iono_i_r) - base_calcs[s]['P']
             SD_CP_calc_i = (rho_i_r - iono_i_r) - base_calcs[s]['CP']
@@ -1750,7 +1719,7 @@ def tab4_procesar():
                 yield f"[PROGRESO] Módulo C Activo: {razon_mod}\n"
                 yield "> [ERROR] Operación Abortada. Módulo C Autónomo (SPP) requiere implementación geométrica dedicada.\n"; return
             else:
-                yield f"[PROGRESO] Módulo B Activo: Interpolación Polinómica Asincrónica ({razon_mod})...\n"
+                yield f"[PROGRESO] Módulo B Activo: Sincronización de Tiempos Duales ({razon_mod})...\n"
                 yield "[PROGRESO] Extrayendo Observables PPK...\n"
                 sd_suavizada = aislar_diferencias_simples_ppk_asincrono(obs_b_raw, obs_r_raw, max_gap=p_max_gap)
             
