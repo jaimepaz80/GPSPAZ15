@@ -185,6 +185,7 @@ def invert_matrix_nxn(M):
         return matmul(transpose_matrix(L_inv), L_inv)
     except:
         return gauss_jordan_inverse(M)
+
 # =====================================================================
 # PARSERS Y GESTIÓN DE ARCHIVOS
 # =====================================================================
@@ -396,6 +397,7 @@ def interpolate_sp3(sp3_data, sat, t_emision, degree=9):
         SP3_CACHE_KEYS.append(cache_key)
     
     return result
+
 def parse_rinex_nav_real(path):
     ephemeris = {'_iono': {'alpha': [0]*4, 'beta': [0]*4}}
     if not path or not os.path.exists(path): return ephemeris
@@ -1064,6 +1066,7 @@ def procesar_ekF_lambda(sd_epoca, nav, sp3, kf_estado, tr, mask_angle, snr_mask)
 
     except Exception as e:
         return None, f"FAILED_EXCEPTION:_{str(e)}", kf_estado, None
+
 # =====================================================================
 # ESTADÍSTICAS Y FILTRADO VINCULANTE
 # =====================================================================
@@ -1391,31 +1394,38 @@ def tab2_efemerides():
             ctx.verify_mode = ssl.CERT_NONE
             
             if not os.path.exists(nav_path):
-                # ENRUTADOR AGRESIVO: Servidores espejo globales (SOPAC, BKG, EPN) con RINEX 2 (brdc)
+                # ENRUTADOR AGRESIVO Y BYPASS SSL:
                 urls_to_try = [
+                    # 1. Intentos HTTPS (Seguros - Si los certificados funcionan)
                     f"https://garner.ucsd.edu/pub/rinex/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
                     f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
                     f"https://www.epncb.oma.be/ftp/obs/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
-                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"
+                    f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz",
+                    # 2. BYPASS DE CERTIFICADO (HTTP Puro por puerto 80 para saltar el error SSL)
+                    f"http://garner.ucsd.edu/pub/rinex/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"http://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"http://www.epncb.oma.be/ftp/obs/BRDC/{year}/{doy:03d}/brdc{doy:03d}0.{yy}n.gz",
+                    f"http://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"
                 ]
                 
                 descargado = False
                 for url_nav in urls_to_try:
                     try:
-                        yield f"  [-] Intentando descargar NAV desde espejo: {url_nav.split('/')[-1]}...\n"
+                        protocolo = "HTTP PURO" if url_nav.startswith("http://") else "HTTPS"
+                        yield f"  [-] Intentando espejo ({protocolo}): {url_nav.split('/')[-1]}...\n"
                         req = urllib.request.Request(url_nav, headers={'User-Agent': 'Mozilla/5.0'})
                         with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
                             with open(nav_gz, 'wb') as f: f.write(res.read())
                         descargado = True
-                        yield f"  [+] Descarga exitosa verificada.\n"
+                        yield f"  [+] Descarga exitosa verificada mediante {protocolo}.\n"
                         break 
                     except Exception as e:
                         err_limpio = str(e).replace('<', '[').replace('>', ']')
-                        yield f"  [!] Falló ({err_limpio}). Saltando a siguiente servidor...\n"
+                        yield f"  [!] Falló ({err_limpio}). Saltando a siguiente pasarela...\n"
                         continue
                 
                 if not descargado:
-                    raise Exception("HTTP 404/Timeout Total: La red global bloqueó la conexión o el archivo no existe.")
+                    raise Exception("Fallo Total: Bloqueo geográfico de IGS o archivos no existen para la fecha en repositorios.")
                 
                 yield "  [-] Descomprimiendo archivo NAV...\n"
                 with gzip.open(nav_gz, 'rb') as f_in, open(nav_path, 'wb') as f_out: 
